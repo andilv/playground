@@ -4,8 +4,13 @@ import shutil
 import time
 import pytest
 import pytest_asyncio # For async fixtures
+import logging
 
 from async_lmdb_cache import AsyncLMDBCacheWrapper, Metrics # Assuming this is the correct import path
+
+# Configure logger for tests if needed, or rely on main module's logger
+logger = logging.getLogger(__name__)
+# Example: logging.basicConfig(level=logging.DEBUG) # to see debug logs from tests
 
 TEST_CACHE_PATH = "/tmp/test_lmdb_cache_pytest"
 BASE_LRU_CAPACITY = 3 # Small capacity for easy testing of LRU
@@ -35,180 +40,345 @@ async def cache():
     if os.path.exists(TEST_CACHE_PATH):
         shutil.rmtree(TEST_CACHE_PATH)
 
-@pytest.mark.asyncio
-async def test_put_get_item(cache: AsyncLMDBCacheWrapper):
-    """Test basic put and get functionality."""
-    key = "test_key_1"
-    value = "test_value_1"
-    await cache.put(key, value, ttl=5) # Longer TTL for this test
-    retrieved_value = await cache.get(key)
-    assert retrieved_value == value
+TEST_CACHE_PATH_LMDB_EVICT = "/tmp/test_lmdb_cache_pytest_lmdb_evict"
+LMDB_EVICT_MAX_KEYS = 10 # Small for testing
+LMDB_EVICT_SAMPLE_SIZE = 5 # Smaller than max_keys
 
-@pytest.mark.asyncio
-async def test_get_non_existent_item(cache: AsyncLMDBCacheWrapper):
-    """Test getting a non-existent item."""
-    retrieved_value = await cache.get("non_existent_key")
-    assert retrieved_value is None
+@pytest_asyncio.fixture
+async def cache_lmdb_evict():
+    if os.path.exists(TEST_CACHE_PATH_LMDB_EVICT):
+        shutil.rmtree(TEST_CACHE_PATH_LMDB_EVICT)
+    os.makedirs(TEST_CACHE_PATH_LMDB_EVICT, exist_ok=True)
 
-@pytest.mark.asyncio
-async def test_item_expires_after_ttl(cache: AsyncLMDBCacheWrapper):
-    """Test that an item expires after its TTL."""
-    key = "test_key_ttl"
-    value = "test_value_ttl"
-    await cache.put(key, value, ttl=BASE_DEFAULT_TTL) # Use fixture's default TTL (1s)
+    cache_instance = AsyncLMDBCacheWrapper(
+        path=TEST_CACHE_PATH_LMDB_EVICT,
+        lru_capacity=5, # TTLCache capacity, less relevant for this specific test
+        lmdb_max_keys=LMDB_EVICT_MAX_KEYS,
+        map_size=10 * 1024 * 1024, # 10MB
+        default_ttl=3600, # Long TTL to ensure items don't expire during test
+        lmdb_lru_sample_size=LMDB_EVICT_SAMPLE_SIZE,
+        cleanup_interval=300 # Not directly tested here
+    )
+    yield cache_instance
+    await cache_instance.close()
+    if os.path.exists(TEST_CACHE_PATH_LMDB_EVICT):
+        shutil.rmtree(TEST_CACHE_PATH_LMDB_EVICT)
 
-    # Item should be present immediately
-    retrieved_value_before_expiry = await cache.get(key)
-    assert retrieved_value_before_expiry == value
+TEST_CACHE_PATH_NO_LIMIT = "/tmp/test_lmdb_cache_pytest_no_limit"
+NUM_ITEMS_FOR_NO_LIMIT_TEST = 20
 
-    await asyncio.sleep(BASE_DEFAULT_TTL + 1) # Wait for TTL to expire + buffer
+@pytest_asyncio.fixture
+async def cache_no_lmdb_limit():
+    if os.path.exists(TEST_CACHE_PATH_NO_LIMIT):
+        shutil.rmtree(TEST_CACHE_PATH_NO_LIMIT)
+    os.makedirs(TEST_CACHE_PATH_NO_LIMIT, exist_ok=True)
 
-    retrieved_value_after_expiry = await cache.get(key)
-    assert retrieved_value_after_expiry is None, "Item should be None after TTL expiry"
-
-@pytest.mark.asyncio
-async def test_lru_eviction_from_ttlcache(cache: AsyncLMDBCacheWrapper):
-    """Test LRU eviction from the in-memory TTLCache."""
-    # Fill the TTLCache to its capacity (BASE_LRU_CAPACITY = 3)
-    await cache.put("lru_key1", "value1", ttl=10)
-    await cache.put("lru_key2", "value2", ttl=10)
-    await cache.put("lru_key3", "value3", ttl=10)
-
-    # At this point, lru_key1, lru_key2, lru_key3 are in TTLCache
-    assert "lru_key1" in cache.lru_cache
-    assert "lru_key2" in cache.lru_cache
-    assert "lru_key3" in cache.lru_cache
-
-    # Access lru_key1 to make it most recently used among the first three
-    await cache.get("lru_key1")
-
-    # Add another item, which should evict the least recently used item from TTLCache.
-    # Current order (MRU to LRU): lru_key1, lru_key3, lru_key2
-    # So, lru_key2 should be evicted from TTLCache.
-    await cache.put("lru_key4", "value4", ttl=10)
-
-    # Check TTLCache contents
-    assert "lru_key4" in cache.lru_cache
-    assert "lru_key1" in cache.lru_cache # Was accessed
-    assert "lru_key3" in cache.lru_cache
-    assert "lru_key2" not in cache.lru_cache, "lru_key2 should have been evicted from TTLCache"
-
-    # Verify that lru_key2 is still retrievable from LMDB
-    retrieved_lru_key2 = await cache.get("lru_key2")
-    assert retrieved_lru_key2 == "value2", "lru_key2 should still be in LMDB"
-    # And now lru_key2 should be back in TTLCache
-    assert "lru_key2" in cache.lru_cache
+    cache_instance = AsyncLMDBCacheWrapper(
+        path=TEST_CACHE_PATH_NO_LIMIT,
+        lru_capacity=10,
+        lmdb_max_keys=None,
+        map_size=20 * 1024 * 1024,
+        default_ttl=3600,
+        lmdb_lru_sample_size=5
+    )
+    yield cache_instance
+    await cache_instance.close()
+    if os.path.exists(TEST_CACHE_PATH_NO_LIMIT):
+        shutil.rmtree(TEST_CACHE_PATH_NO_LIMIT)
 
 
-@pytest.mark.asyncio
-async def test_item_persistence_in_lmdb(cache: AsyncLMDBCacheWrapper):
-    """Test that items persist in LMDB even if not in TTLCache and can be reloaded."""
-    key = "persist_key"
-    value = "persist_value"
-    await cache.put(key, value, ttl=10)
+class TestCoreCacheFunctionality:
+    @pytest.mark.asyncio
+    async def test_put_get_item(self, cache: AsyncLMDBCacheWrapper):
+        """Test basic put and get functionality."""
+        key = "test_key_1"
+        value = "test_value_1"
+        await cache.put(key, value, ttl=5)
+        retrieved_value = await cache.get(key)
+        assert retrieved_value == value
 
-    # Simulate TTLCache eviction by clearing it (or just ensure key is not there)
-    # For this test, let's assume it got evicted or we are checking after a restart (conceptually)
-    cache.lru_cache.clear()
-    assert key not in cache.lru_cache
+    @pytest.mark.asyncio
+    async def test_get_non_existent_item(self, cache: AsyncLMDBCacheWrapper):
+        """Test getting a non-existent item."""
+        retrieved_value = await cache.get("non_existent_key")
+        assert retrieved_value is None
 
-    # Retrieve the item. It should be fetched from LMDB.
-    retrieved_value = await cache.get(key)
-    assert retrieved_value == value
-    # After retrieval, it should be back in TTLCache
-    assert key in cache.lru_cache
+    @pytest.mark.asyncio
+    async def test_item_expires_after_ttl(self, cache: AsyncLMDBCacheWrapper):
+        """Test that an item expires after its TTL."""
+        key = "test_key_ttl"
+        value = "test_value_ttl"
+        await cache.put(key, value, ttl=BASE_DEFAULT_TTL)
 
-@pytest.mark.asyncio
-async def test_delete_item(cache: AsyncLMDBCacheWrapper):
-    """Test deleting an item."""
-    key = "delete_key"
-    value = "delete_value"
-    await cache.put(key, value, ttl=10)
+        retrieved_value_before_expiry = await cache.get(key)
+        assert retrieved_value_before_expiry == value
 
-    retrieved_value_before_delete = await cache.get(key)
-    assert retrieved_value_before_delete == value
+        await asyncio.sleep(BASE_DEFAULT_TTL + 1)
 
-    await cache.delete(key)
+        retrieved_value_after_expiry = await cache.get(key)
+        assert retrieved_value_after_expiry is None, "Item should be None after TTL expiry"
 
-    retrieved_value_after_delete = await cache.get(key)
-    assert retrieved_value_after_delete is None
-    assert key not in cache.lru_cache # Should also be removed from TTLCache
+    @pytest.mark.asyncio
+    async def test_lru_eviction_from_ttlcache(self, cache: AsyncLMDBCacheWrapper):
+        """Test LRU eviction from the in-memory TTLCache."""
+        await cache.put("lru_key1", "value1", ttl=10)
+        await cache.put("lru_key2", "value2", ttl=10)
+        await cache.put("lru_key3", "value3", ttl=10)
 
-@pytest.mark.asyncio
-async def test_metrics_reporting(cache: AsyncLMDBCacheWrapper):
-    """Test basic metrics reporting."""
-    key1 = "metrics_key1"
-    value1 = "metrics_value1"
-    key2 = "metrics_key2" # Will be a miss then a hit
+        assert "lru_key1" in cache.lru_cache
+        assert "lru_key2" in cache.lru_cache
+        assert "lru_key3" in cache.lru_cache
 
-    # Initial state
-    initial_metrics = cache.metrics.report()
-    assert initial_metrics["lru_hits"] == 0
-    assert initial_metrics["lmdb_hits"] == 0
-    assert initial_metrics["lru_misses"] == 0
-    assert initial_metrics["lmdb_misses"] == 0
+        await cache.get("lru_key1")
 
-    # Put and Get (LRU hit for TTLCache, LMDB access time update)
-    await cache.put(key1, value1, ttl=5) # Put into LMDB and TTLCache
-    await cache.get(key1) # Get from TTLCache
+        await cache.put("lru_key4", "value4", ttl=10)
 
-    # Get non-existent (LRU miss, LMDB miss)
-    await cache.get(key2)
+        assert "lru_key4" in cache.lru_cache
+        assert "lru_key1" in cache.lru_cache
+        assert "lru_key3" in cache.lru_cache
+        assert "lru_key2" not in cache.lru_cache, "lru_key2 should have been evicted from TTLCache"
 
-    # Put second item, then get it (loaded into TTLCache from LMDB after initial miss)
-    await cache.put(key2, "value2", ttl=5)
-    await cache.get(key2) # Get from TTLCache (was an LMDB hit that populated TTLCache)
+        retrieved_lru_key2 = await cache.get("lru_key2")
+        assert retrieved_lru_key2 == "value2", "lru_key2 should still be in LMDB"
+        assert "lru_key2" in cache.lru_cache
 
-    final_metrics = cache.metrics.report()
+    @pytest.mark.asyncio
+    async def test_item_persistence_in_lmdb(self, cache: AsyncLMDBCacheWrapper):
+        """Test that items persist in LMDB even if not in TTLCache and can be reloaded."""
+        key = "persist_key"
+        value = "persist_value"
+        await cache.put(key, value, ttl=10)
 
-    # Based on the operations:
-    # put(key1): no hit/miss change for 'get' metrics
-    # get(key1): lru_hit for key1
-    # get(key2): lru_miss for key2, lmdb_miss for key2
-    # put(key2): no hit/miss change
-    # get(key2): lru_hit for key2 (it was put into lru_cache during the previous put)
+        cache.lru_cache.clear()
+        assert key not in cache.lru_cache
 
-    # Let's re-evaluate the sequence for metrics:
-    # 1. await cache.put(key1, value1, ttl=5)
-    #    - TTLCache: key1 is added.
-    #    - LMDB: key1 is added.
-    # 2. await cache.get(key1)
-    #    - TTLCache: Hit for key1. metrics.lru_hits = 1.
-    # 3. await cache.get(key2)
-    #    - TTLCache: Miss for key2. metrics.lru_misses = 1.
-    #    - LMDB: Miss for key2. metrics.lmdb_misses = 1.
-    # 4. await cache.put(key2, "value2", ttl=5)
-    #    - TTLCache: key2 is added.
-    #    - LMDB: key2 is added.
-    # 5. await cache.get(key2)
-    #    - TTLCache: Hit for key2. metrics.lru_hits = 2.
+        retrieved_value = await cache.get(key)
+        assert retrieved_value == value
+        assert key in cache.lru_cache
 
-    assert final_metrics["lru_hits"] >= 2 # key1, key2
-    assert final_metrics["lru_misses"] >= 1 # key2 initial miss
-    assert final_metrics["lmdb_misses"] >= 1 # key2 initial miss from lmdb
-    # lmdb_hits occur when an item is found in LMDB after a TTLCache miss.
-    # In the above sequence, get(key2) is an lru_miss and lmdb_miss.
-    # Then put(key2) adds it.
-    # Then get(key2) is an lru_hit.
-    # To test lmdb_hit:
-    #   put("lmdb_hit_key", "v")
-    #   cache.lru_cache.pop("lmdb_hit_key") # Simulate eviction
-    #   await cache.get("lmdb_hit_key") -> This would be lru_miss, lmdb_hit
+    @pytest.mark.asyncio
+    async def test_delete_item(self, cache: AsyncLMDBCacheWrapper):
+        """Test deleting an item."""
+        key = "delete_key"
+        value = "delete_value"
+        await cache.put(key, value, ttl=10)
 
-    # Test LMDB hit explicitly
-    key_lmdb_hit = "key_for_lmdb_hit"
-    await cache.put(key_lmdb_hit, "value_lmdb_hit", ttl=5)
-    # Ensure it's out of lru_cache to force LMDB lookup
-    popped = cache.lru_cache.pop(key_lmdb_hit, None)
-    assert popped is not None, "Key should have been in lru_cache to pop"
-    assert key_lmdb_hit not in cache.lru_cache
+        retrieved_value_before_delete = await cache.get(key)
+        assert retrieved_value_before_delete == value
 
-    await cache.get(key_lmdb_hit) # This should be an LRU miss and an LMDB hit
+        await cache.delete(key)
 
-    final_metrics_after_lmdb_hit_test = cache.metrics.report()
-    assert final_metrics_after_lmdb_hit_test["lmdb_hits"] >= 1
-    assert final_metrics_after_lmdb_hit_test["avg_get_latency_ms"] > 0 or len(cache.metrics.get_latency) == 0 # check avg or raw
-    assert final_metrics_after_lmdb_hit_test["avg_put_latency_ms"] > 0 or len(cache.metrics.put_latency) == 0 # check avg or raw
+        retrieved_value_after_delete = await cache.get(key)
+        assert retrieved_value_after_delete is None
+        assert key not in cache.lru_cache
+
+class TestLMDBLimitsAndEviction:
+    @pytest.mark.asyncio
+    async def test_lmdb_lru_eviction_triggers(self, cache_lmdb_evict: AsyncLMDBCacheWrapper):
+        """Test that LMDB LRU eviction is triggered when lmdb_max_keys is exceeded."""
+        cache = cache_lmdb_evict
+        num_items_to_add = LMDB_EVICT_MAX_KEYS + 5
+
+        added_keys = []
+        for i in range(num_items_to_add):
+            key = f"lmdb_evict_key_{i}"
+            value = f"value_{i}"
+            await cache.put(key, value)
+            added_keys.append(key)
+            if key in cache.lru_cache:
+                cache.lru_cache.pop(key)
+            await asyncio.sleep(0.001)
+
+        current_lmdb_entries = 0
+        with cache.env.begin(db=cache.db) as txn:
+            current_lmdb_entries = txn.stat()['entries']
+
+        logger.info(f"LMDB entries after puts: {current_lmdb_entries}, lmdb_max_keys: {LMDB_EVICT_MAX_KEYS}")
+
+        assert current_lmdb_entries <= LMDB_EVICT_MAX_KEYS, "LMDB entries should be at or below max_keys after eviction"
+        assert current_lmdb_entries < num_items_to_add, "Eviction should have reduced the number of items"
+
+        evicted_count_metric = cache.metrics.report()["lmdb_lru_evictions"]
+        assert evicted_count_metric > 0, "LMDB LRU eviction metric should show evictions"
+
+        checked_early_keys_present = 0
+        for i in range(min(LMDB_EVICT_SAMPLE_SIZE, len(added_keys))):
+            key_to_check = added_keys[i]
+            if await cache.get(key_to_check) is not None:
+                checked_early_keys_present +=1
+
+        checked_later_keys_present = 0
+        for i in range(max(0, len(added_keys) - LMDB_EVICT_SAMPLE_SIZE), len(added_keys)):
+            key_to_check = added_keys[i]
+            if await cache.get(key_to_check) is not None:
+                checked_later_keys_present +=1
+
+        logger.info(f"Early keys present (from first {LMDB_EVICT_SAMPLE_SIZE}): {checked_early_keys_present}")
+        logger.info(f"Later keys present (from last {LMDB_EVICT_SAMPLE_SIZE}): {checked_later_keys_present}")
+
+        lru_db_keys_with_time = []
+        with cache.env.begin(db=cache.lru_db) as txn:
+            for key_b, time_b in txn.cursor():
+                try:
+                    lru_db_keys_with_time.append({'key': key_b.decode('utf-8'), 'time': float(time_b.decode('utf-8'))})
+                except ValueError:
+                    continue
+        lru_db_keys_with_time.sort(key=lambda x: x['time'])
+
+        main_db_keys = set()
+        with cache.env.begin(db=cache.db) as txn:
+            for key_b, _ in txn.cursor():
+                main_db_keys.add(key_b.decode('utf-8'))
+
+        logger.info(f"Total keys in LRU DB: {len(lru_db_keys_with_time)}")
+        logger.info(f"Total keys in Main DB: {len(main_db_keys)}")
+
+    @pytest.mark.asyncio
+    async def test_lmdb_no_key_limit(self, cache_no_lmdb_limit: AsyncLMDBCacheWrapper):
+        """Test that no LMDB LRU eviction occurs when lmdb_max_keys is None."""
+        cache = cache_no_lmdb_limit
+
+        for i in range(NUM_ITEMS_FOR_NO_LIMIT_TEST):
+            key = f"no_limit_key_{i}"
+            value = f"value_{i}"
+            await cache.put(key, value)
+            if key in cache.lru_cache:
+                cache.lru_cache.pop(key)
+
+        main_db_entries_count = 0
+        with cache.env.begin(db=cache.db) as txn:
+            main_db_entries_count = txn.stat()['entries']
+
+        assert main_db_entries_count == NUM_ITEMS_FOR_NO_LIMIT_TEST, \
+               f"All {NUM_ITEMS_FOR_NO_LIMIT_TEST} items should be present in LMDB when lmdb_max_keys is None"
+
+        metrics = cache.metrics.report()
+        assert metrics["lmdb_lru_evictions"] == 0, \
+               "lmdb_lru_evictions metric should be 0 when lmdb_max_keys is None"
+
+        for i in range(NUM_ITEMS_FOR_NO_LIMIT_TEST):
+            key = f"no_limit_key_{i}"
+            retrieved_value = await cache.get(key)
+            assert retrieved_value == f"value_{i}", f"Item {key} should be retrievable"
+
+class TestCacheMetrics:
+    @pytest.mark.asyncio
+    async def test_metrics_reporting_detailed(self, cache: AsyncLMDBCacheWrapper):
+        """Test detailed and precise metrics reporting after specific cache operations."""
+
+        initial_metrics = cache.metrics.report()
+        assert initial_metrics["lru_hits"] == 0
+        assert initial_metrics["lru_misses"] == 0
+        assert initial_metrics["lmdb_hits"] == 0
+        assert initial_metrics["lmdb_misses"] == 0
+        assert initial_metrics["lru_evictions"] == 0
+        assert initial_metrics["lmdb_deletions"] == 0
+        assert initial_metrics["lmdb_lru_evictions"] == 0
+        assert len(cache.metrics.get_latency) == 0
+        assert len(cache.metrics.put_latency) == 0
+
+        key1, value1 = "metric_key1", "value1"
+        await cache.put(key1, value1, ttl=10)
+
+        metrics_after_put1 = cache.metrics.report()
+        assert len(cache.metrics.put_latency) == 1
+        lru_hits_before_get1 = metrics_after_put1["lru_hits"]
+        lru_misses_before_get1 = metrics_after_put1["lru_misses"]
+        lmdb_hits_before_get1 = metrics_after_put1["lmdb_hits"]
+        lmdb_misses_before_get1 = metrics_after_put1["lmdb_misses"]
+
+        await cache.get(key1)
+        metrics_after_get1 = cache.metrics.report()
+        assert metrics_after_get1["lru_hits"] == lru_hits_before_get1 + 1
+        assert metrics_after_get1["lru_misses"] == lru_misses_before_get1
+        assert metrics_after_get1["lmdb_hits"] == lmdb_hits_before_get1
+        assert metrics_after_get1["lmdb_misses"] == lmdb_misses_before_get1
+        assert len(cache.metrics.get_latency) == 1
+
+        key_non_existent = "metric_key_non_existent"
+        await cache.get(key_non_existent)
+
+        metrics_after_get_non_existent = cache.metrics.report()
+        assert metrics_after_get_non_existent["lru_hits"] == metrics_after_get1["lru_hits"]
+        assert metrics_after_get_non_existent["lru_misses"] == metrics_after_get1["lru_misses"] + 1
+        assert metrics_after_get_non_existent["lmdb_hits"] == metrics_after_get1["lmdb_hits"]
+        assert metrics_after_get_non_existent["lmdb_misses"] == metrics_after_get1["lmdb_misses"] + 1
+        assert len(cache.metrics.get_latency) == 2
+
+        key2, value2 = "metric_key2", "value2"
+        await cache.put(key2, value2, ttl=10)
+
+        if key2 in cache.lru_cache:
+            cache.lru_cache.pop(key2)
+
+        assert key2 not in cache.lru_cache, "key2 should be out of TTLCache for this sequence"
+
+        await cache.get(key2)
+
+        metrics_after_lmdb_hit = cache.metrics.report()
+        assert metrics_after_lmdb_hit["lru_hits"] == metrics_after_get_non_existent["lru_hits"]
+        assert metrics_after_lmdb_hit["lru_misses"] == metrics_after_get_non_existent["lru_misses"] + 1
+        assert metrics_after_lmdb_hit["lmdb_hits"] == metrics_after_get_non_existent["lmdb_hits"] + 1
+        assert metrics_after_lmdb_hit["lmdb_misses"] == metrics_after_get_non_existent["lmdb_misses"]
+        assert len(cache.metrics.get_latency) == 3
+        assert len(cache.metrics.put_latency) == 2
+
+        key_ttl, value_ttl = "metric_key_ttl", "value_ttl"
+        await cache.put(key_ttl, value_ttl, ttl=cache.default_ttl)
+
+        await asyncio.sleep(cache.default_ttl + 0.5)
+
+        await cache.get(key_ttl)
+
+        metrics_after_expired_get = cache.metrics.report()
+        assert metrics_after_expired_get["lru_misses"] == metrics_after_lmdb_hit["lru_misses"] + 1
+        assert metrics_after_expired_get["lmdb_misses"] == metrics_after_lmdb_hit["lmdb_misses"] + 1
+        assert metrics_after_expired_get["lmdb_deletions"] >= initial_metrics["lmdb_deletions"] + 1
+        assert len(cache.metrics.get_latency) == 4
+        assert len(cache.metrics.put_latency) == 3
+
+        key_del, value_del = "metric_key_del", "value_del"
+        await cache.put(key_del, value_del, ttl=10)
+        await cache.get(key_del)
+
+        lmdb_deletions_before_explicit_del = metrics_after_expired_get["lmdb_deletions"]
+        await cache.delete(key_del)
+
+        metrics_after_delete = cache.metrics.report()
+        assert metrics_after_delete["lmdb_deletions"] == lmdb_deletions_before_explicit_del + 1
+        assert len(cache.metrics.put_latency) == 4
+
+        cache.lru_cache.clear()
+        lru_evictions_at_start_of_seq6 = cache.metrics.report()["lru_evictions"]
+
+        put_count_start_seq6 = len(cache.metrics.put_latency)
+
+        await cache.put("evict_test_1", "val", ttl=10)
+        await cache.put("evict_test_2", "val", ttl=10)
+        await cache.put("evict_test_3", "val", ttl=10)
+
+        get_count_start_seq6 = len(cache.metrics.get_latency)
+
+        await cache.get("evict_test_1")
+        await cache.get("evict_test_2")
+
+        await cache.put("evict_test_4", "val", ttl=10)
+
+        metrics_after_lru_eviction = cache.metrics.report()
+        assert metrics_after_lru_eviction["lru_evictions"] == lru_evictions_at_start_of_seq6 + 1, \
+            "lru_evictions metric should increment after TTLCache capacity eviction"
+
+        assert metrics_after_lru_eviction["lmdb_lru_evictions"] == initial_metrics["lmdb_lru_evictions"], \
+            "lmdb_lru_evictions should not be affected by TTLCache eviction"
+
+        total_gets = get_count_start_seq6 + 2
+        total_puts = put_count_start_seq6 + 4
+
+        assert len(cache.metrics.get_latency) == total_gets
+        assert len(cache.metrics.put_latency) == total_puts
+
+        assert metrics_after_lru_eviction["avg_get_latency_ms"] >= 0
+        assert metrics_after_lru_eviction["avg_put_latency_ms"] >= 0
 
 # It's good practice to add requirements for these tests if not already present
 # pip install pytest pytest-asyncio
