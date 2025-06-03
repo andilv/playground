@@ -1,0 +1,5 @@
+lmdb
+msgpack
+cachetools
+fastapi
+uvicorn
