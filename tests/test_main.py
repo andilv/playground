@@ -205,6 +205,17 @@ def test_detect_two_words_unknown_bigram():
     else:
         assert data["syntactic_confidence_score"] > (1.0 - 0.80)
 
+def test_detect_semantic_gibberish_verdant_somnolence():
+    """Test a sentence that is grammatically plausible but semantically nonsensical."""
+    response = client.post("/detect", json={"text": "The verdant somnolence of the chromatic paradoxes elucidated the ephemeral quiddity of the preternatural luminescence."})
+    assert response.status_code == 200
+    data = response.json()
+    validate_response_structure(data)
+    assert data["is_char_gibberish"] == False
+    assert data["char_gibberish_confidence"] >= 0.7 # Words are English-like
+    assert data["is_syntactically_gibberish"] == True # Should be syntactically gibberish due to rare/odd bigrams
+    assert data["syntactic_confidence_score"] >= 0.80 # Aligning with DEFAULT_THRESHOLD_SEMANTIC
+
 
 # --- Test NLTK Resource Loading ---
 import gibberish_detector # Import the module directly
