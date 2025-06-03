@@ -2,4 +2,6 @@ lmdb
 msgpack
 cachetools
 fastapi
-uvicorn
+uvicorn[standard]
+pytest
+pytest-asyncio
