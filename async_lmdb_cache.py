@@ -57,22 +57,43 @@ class LMDBWorkerThread(threading.Thread):
             # print(f"DEBUG MSGFIX DECODE: Returning expire_at={expire_at}, value type={type(value)}", flush=True) # Too verbose
             return expire_at if expire_at != 0 else None, value
         except msgpack.ExtraData as e_extra:
-            print(f"DEBUG MSGFIX DECODE: msgpack.ExtraData caught: {e_extra}", flush=True)
-            print(f"DEBUG MSGFIX DECODE: Data causing ExtraData (hex): {data.hex()}", flush=True)
-            # Try to unpack just the beginning part if it's ExtraData
+            # logger.debug(f"msgpack.ExtraData caught: {e_extra}. Data (hex): {data.hex()}")
             try:
                 unpacker = msgpack.Unpacker(raw=False)
                 unpacker.feed(data)
                 first_obj = unpacker.unpack()
-                print(f"DEBUG MSGFIX DECODE: First object in ExtraData: {first_obj}", flush=True)
-                offset = unpacker.tell()
-                print(f"DEBUG MSGFIX DECODE: Offset after first object: {offset}", flush=True)
-                if offset < len(data):
-                    remaining_data = data[offset:]
-                    print(f"DEBUG MSGFIX DECODE: Remaining data (hex): {remaining_data.hex()}", flush=True)
+                # Check if first_obj is a dict and has the expected keys
+                if isinstance(first_obj, dict) and 'expire_at' in first_obj and 'value' in first_obj:
+                    offset = unpacker.tell()
+                    if offset < len(data):
+                        remaining_data = data[offset:]
+                        logger.warning(
+                            f"Handled msgpack.ExtraData by using the first unpacked object. "
+                            f"Remaining data (hex): {remaining_data.hex()}"
+                        )
+                    else:
+                        logger.warning(
+                            "Handled msgpack.ExtraData by using the first unpacked object. "
+                            "No remaining data after first object."
+                        )
+                    # Use first_obj as the successfully unpacked object
+                    expire_at = first_obj.get('expire_at')
+                    value = first_obj.get('value')
+                    return expire_at if expire_at != 0 else None, value
+                else:
+                    # Log that first_obj was not as expected, then re-raise
+                    logger.error(
+                        f"msgpack.ExtraData: First object unpacked was not valid or missing keys. "
+                        f"first_obj: {first_obj}. Re-raising ExtraData."
+                    )
+                    raise e_extra  # Re-raise the original ExtraData
             except Exception as e_unpack_detail:
-                print(f"DEBUG MSGFIX DECODE: Could not get details from ExtraData: {e_unpack_detail}", flush=True)
-            raise # Re-raise the original ExtraData exception
+                # Log details of failure to unpack/handle ExtraData, then re-raise original
+                logger.error(
+                    f"msgpack.ExtraData: Could not get details or handle ExtraData appropriately: {e_unpack_detail}. "
+                    f"Data (hex): {data.hex()}. Re-raising original ExtraData."
+                )
+                raise e_extra # Re-raise the original ExtraData
         except msgpack.UnpackException as e_unpack:
             print(f"DEBUG MSGFIX DECODE: msgpack.UnpackException (other than ExtraData) caught: {e_unpack}", flush=True)
             print(f"DEBUG MSGFIX DECODE: Data causing other UnpackException (hex): {data.hex()}", flush=True)
@@ -412,9 +433,60 @@ class BaseLMDBCacheWrapper:
     def _encode_value(self, value: Any, expire_at: int) -> bytes:
         return msgpack.packb({'expire_at': expire_at, 'value': value}, use_bin_type=True)
     def _decode_value(self, data: bytes) -> Tuple[Optional[int], Any]:
-        if not data: return None, None
-        unpacked = msgpack.unpackb(data, raw=False); expire_at = unpacked.get('expire_at')
-        return expire_at if expire_at != 0 else None, unpacked.get('value')
+        # This method is used by AsyncLMDBCacheWrapper.get() when processing data from LMDB.
+        # It needs the same ExtraData handling as LMDBWorkerThread._decode_value.
+        # print(f"DEBUG ASYNC WRAPPER DECODE: Received data (hex): {data.hex() if data else 'None'}", flush=True)
+        if not data:
+            # print("DEBUG ASYNC WRAPPER DECODE: Data is None or empty, returning None, None", flush=True)
+            return None, None
+        try:
+            unpacked = msgpack.unpackb(data, raw=False)
+            # print(f"DEBUG ASYNC WRAPPER DECODE: Unpacked successfully: {unpacked}", flush=True)
+            expire_at = unpacked.get('expire_at')
+            value = unpacked.get('value')
+            return expire_at if expire_at != 0 else None, value
+        except msgpack.ExtraData as e_extra:
+            # logger.debug(f"ASYNC WRAPPER DECODE: msgpack.ExtraData caught: {e_extra}. Data (hex): {data.hex()}")
+            try:
+                unpacker = msgpack.Unpacker(raw=False)
+                unpacker.feed(data)
+                first_obj = unpacker.unpack()
+                if isinstance(first_obj, dict) and 'expire_at' in first_obj and 'value' in first_obj:
+                    offset = unpacker.tell()
+                    if offset < len(data):
+                        remaining_data = data[offset:]
+                        logger.warning(
+                            f"ASYNC WRAPPER DECODE: Handled msgpack.ExtraData by using the first unpacked object. "
+                            f"Remaining data (hex): {remaining_data.hex()}"
+                        )
+                    else:
+                        logger.warning(
+                            "ASYNC WRAPPER DECODE: Handled msgpack.ExtraData by using the first unpacked object. "
+                            "No remaining data after first object."
+                        )
+                    expire_at = first_obj.get('expire_at')
+                    value = first_obj.get('value')
+                    return expire_at if expire_at != 0 else None, value
+                else:
+                    logger.error(
+                        f"ASYNC WRAPPER DECODE: msgpack.ExtraData: First object unpacked was not valid or missing keys. "
+                        f"first_obj: {first_obj}. Re-raising ExtraData."
+                    )
+                    raise # Re-raise the original ExtraData
+            except Exception as e_unpack_detail:
+                logger.error(
+                    f"ASYNC WRAPPER DECODE: msgpack.ExtraData: Could not get details or handle ExtraData: {e_unpack_detail}. "
+                    f"Data (hex): {data.hex()}. Re-raising original ExtraData."
+                )
+                raise e_extra # Re-raise the original ExtraData
+        except msgpack.UnpackException as e_unpack:
+            # print(f"DEBUG ASYNC WRAPPER DECODE: msgpack.UnpackException (other than ExtraData) caught: {e_unpack}", flush=True)
+            # print(f"DEBUG ASYNC WRAPPER DECODE: Data causing other UnpackException (hex): {data.hex()}", flush=True)
+            raise # Re-raise
+        except Exception as e_gen:
+            # print(f"DEBUG ASYNC WRAPPER DECODE: Generic Exception caught during decode: {e_gen}", flush=True)
+            # print(f"DEBUG ASYNC WRAPPER DECODE: Data causing Generic Exception (hex): {data.hex()}", flush=True)
+            raise
 
     def _lmdb_get_operation(self, db_ref_name: str, key_b: bytes) -> Optional[bytes]:
         return self._submit_lmdb_command((CMD_GET_VALUE, db_ref_name, key_b))
@@ -529,16 +601,24 @@ class AsyncLMDBCacheWrapper(BaseLMDBCacheWrapper):
         try:
             expire_at, value = self._decode_value(data_bytes)
         except msgpack.UnpackException as e:
-            print(f"DEBUG MSGFIX KEYLOG ASYNC GET: Caught in AsyncLMDBCacheWrapper.get: {e}", flush=True)
-            print(f"DEBUG MSGFIX KEYLOG ASYNC GET: Problematic key: {key_b.decode('utf-8', errors='ignore')}", flush=True) # key_b should be in scope
+            # Replaced print with logger.warning and added metrics increment
+            logger.warning(
+                f"Failed to decode item from LMDB for key '{key_b.decode('utf-8', errors='ignore')}': {e}",
+                exc_info=True
+            )
+            self.metrics.lmdb_misses += 1 # Increment lmdb_misses for unparseable data
+            self.metrics.get_latency.append(time.monotonic() - start_time) # Also record latency for this attempt
             return None
         current_time = time.time()
-        if expire_at is not None and current_time > expire_at:
+        if expire_at is not None and current_time > expire_at: # Data found in LMDB, but it's expired
             logger.info(f"Key '{key}' found in LMDB but expired (async). Deleting.")
             if not self._base_is_closing:
                 asyncio.create_task(self._dispatch_lmdb_op_async((CMD_DELETE_VALUE, 'main', key_b), fire_and_forget=True))
                 asyncio.create_task(self._dispatch_lmdb_op_async((CMD_DELETE_VALUE, 'lru', key_b), fire_and_forget=True))
-            self.metrics.lmdb_deletions += 1; self.metrics.get_latency.append(time.monotonic() - start_time); return None
+            self.metrics.lmdb_deletions += 1
+            self.metrics.lmdb_misses += 1 # Increment lmdb_misses for expired items
+            self.metrics.get_latency.append(time.monotonic() - start_time)
+            return None
         self.metrics.lmdb_hits += 1
         if not self._base_is_closing:
              # Restoring actual call
