@@ -98,7 +98,7 @@ if __name__ == "__main__":
     print(f"Default TTL: {async_cache.default_ttl}s, LRU Capacity: {async_cache.lru_cache.maxsize}")
     print("Available endpoints:")
     print(f"  GET /item/{{key}}")
-    print(f"  POST /item/{{key}} (JSON body: {{"value": "your_value", "ttl": optional_seconds}})")
+    print(f"  POST /item/{{key}} (JSON body: {{"value": "your_value", "ttl": {optional_seconds}}})")
     print(f"  DELETE /item/{{key}}")
     print(f"  GET /metrics")
     print(f"Ensure the LMDB path '{CACHE_PATH}' is accessible and writable.")

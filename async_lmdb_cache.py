@@ -55,7 +55,7 @@ class LMDBWorkerThread(threading.Thread):
                 logger.warning("LMDBWorker: Environment already initialized. Closing old one first.")
                 self.env.close()
             logger.info(f"LMDBWorker: Initializing environment at {path} with map_size {map_size}")
-            self.env = lmdb.open(path, max_dbs=max_dbs, map_size=map_size, lock=True, max_readers=126, sync=True)
+            self.env = lmdb.open(path, max_dbs=max_dbs, map_size=map_size, lock=True, max_readers=126, sync=True, subdir=True) # Explicitly set subdir=True
             self.db = self.env.open_db()
             self._lmdb_lru_db_name_bytes = lru_db_name_bytes
             self.lru_db = self.env.open_db(self._lmdb_lru_db_name_bytes)
@@ -69,7 +69,12 @@ class LMDBWorkerThread(threading.Thread):
     def _execute_close_env(self, future):
         try:
             if self.env:
-                logger.info("LMDBWorker: Closing environment.")
+                logger.info("LMDBWorker: Closing environment. Syncing before close.")
+                try:
+                    self.env.sync(True) # Force a sync before closing
+                    logger.info("LMDBWorker: Environment synced successfully.")
+                except Exception as sync_e:
+                    logger.error(f"LMDBWorker: Exception during env sync before close: {sync_e}", exc_info=True)
                 self.env.close()
                 self.env = None; self.db = None; self.lru_db = None
             future.set_result(True)
@@ -98,9 +103,13 @@ class LMDBWorkerThread(threading.Thread):
                         current_entries_after_evict = wtxn_main.stat()['entries']
                         if current_entries_after_evict >= self._lmdb_max_keys:
                             logger.error(f"LMDBWorker: Max keys limit {self._lmdb_max_keys} still reached after LRU eviction (current {current_entries_after_evict}). Put for {key_b.decode('utf-8','ignore')} may cause overfill or fail.")
+                    logger.debug(f"LMDBWorker: Putting key {key_b!r}, value {value_b!r} (original value type: {type(value_b)}).")
                     wtxn_main.put(key_b, value_b)
+                self.env.sync(True) # Explicit sync after main DB put
                 future.set_result(True); return
+            logger.debug(f"LMDBWorker: Putting key {key_b!r}, value {value_b!r} (original value type: {type(value_b)}).")
             with self.env.begin(db=db_to_use, write=True) as txn: txn.put(key_b, value_b)
+            self.env.sync(True) # Explicit sync after other DB put
             future.set_result(True)
         except Exception as e: future.set_exception(e)
 
@@ -303,6 +312,14 @@ class BaseLMDBCacheWrapper:
         self.lock = threading.Lock()
         self._lmdb_max_keys_config = lmdb_max_keys if lmdb_max_keys is not None else float('inf')
         self._lmdb_lru_sample_size_config = lmdb_lru_sample_size
+        # Ensure the directory is clean before starting the worker and initializing LMDB
+        import shutil
+        import os
+        if os.path.exists(path):
+            logger.info(f"BaseLMDBCacheWrapper: Cleaning up existing LMDB directory at {path} before worker init.")
+            shutil.rmtree(path)
+        os.makedirs(path, exist_ok=True) # Ensure directory exists
+
         self.lmdb_worker = LMDBWorkerThread(base_wrapper_metrics_ref=self.metrics)
         self.lmdb_worker.start()
         init_future = concurrent.futures.Future()
@@ -319,7 +336,8 @@ class BaseLMDBCacheWrapper:
             logger.critical(f"BaseLMDBCacheWrapper: Failed to initialize LMDB via worker: {e}", exc_info=True)
             self._stop_lmdb_worker_sync_on_error()
             raise ConnectionError(f"Failed to initialize LMDB via worker: {e}") from e
-        self.lru_cache = CustomTTLCache(maxsize=lru_capacity, ttl=default_ttl, on_evict=self._on_lru_evict_callback)
+        self.lru_cache = CustomTTLCache(maxsize=lru_capacity, ttl=default_ttl)
+        self.lru_cache.eviction_callback = self._on_lru_evict_callback # Set callback after init
         self.default_ttl = default_ttl
         self.cleanup_interval = cleanup_interval
 
@@ -559,9 +577,25 @@ class AsyncLMDBCacheWrapper(BaseLMDBCacheWrapper):
             except Exception as e: logger.error(f"[Async Cleanup] Error in wait logic: {e}", exc_info=True); break
         logger.info("Async cleanup loop finished.")
 
+    async def stop_background_cleanup(self):
+        if self._cleanup_task and not self._cleanup_task.done():
+            logger.info("Stopping async cache background cleanup task.")
+            self._stop_cleanup.set()
+            try:
+                # Give it a bit more time than cleanup_interval to gracefully shut down
+                await asyncio.wait_for(self._cleanup_task, timeout=self.cleanup_interval + 5)
+            except asyncio.TimeoutError:
+                logger.warning("Async cleanup task did not stop gracefully within timeout.")
+            except Exception as e:
+                logger.error(f"Error waiting for async cleanup task to stop: {e}", exc_info=True)
+            self._cleanup_task = None
+        else:
+            logger.info("Async cache background cleanup task not running or already stopped.")
+
     async def close(self):
         logger.info("Closing AsyncLMDBCacheWrapper...")
-        if hasattr(self, 'stop_background_cleanup'): await self.stop_background_cleanup()
+        # Ensure the background cleanup task is stopped before closing the LMDB environment
+        await self.stop_background_cleanup()
         # Base class close() now handles setting _base_is_closing and commanding worker
         await asyncio.to_thread(super().close)
         logger.info("AsyncLMDBCacheWrapper fully closed.")

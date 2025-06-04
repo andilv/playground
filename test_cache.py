@@ -10,7 +10,7 @@ from async_lmdb_cache import AsyncLMDBCacheWrapper, Metrics # Assuming this is t
 
 # Configure logger for tests if needed, or rely on main module's logger
 logger = logging.getLogger(__name__)
-# Example: logging.basicConfig(level=logging.DEBUG) # to see debug logs from tests
+logging.basicConfig(level=logging.DEBUG) # to see debug logs from tests
 
 TEST_CACHE_PATH = "/tmp/test_lmdb_cache_pytest"
 BASE_LRU_CAPACITY = 3 # Small capacity for easy testing of LRU
@@ -24,6 +24,7 @@ async def cache():
     # Cleanup before test run
     if os.path.exists(TEST_CACHE_PATH):
         shutil.rmtree(TEST_CACHE_PATH)
+        time.sleep(0.1) # Add a small delay after rmtree
     os.makedirs(TEST_CACHE_PATH, exist_ok=True)
 
     cache_instance = AsyncLMDBCacheWrapper(
