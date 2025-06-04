@@ -44,10 +44,43 @@ class LMDBWorkerThread(threading.Thread):
         return msgpack.packb({'expire_at': expire_at, 'value': value}, use_bin_type=True)
 
     def _decode_value(self, data: bytes) -> Tuple[Optional[int], Any]:
-        if not data: return None, None
-        unpacked = msgpack.unpackb(data, raw=False)
-        expire_at = unpacked.get('expire_at')
-        return expire_at if expire_at != 0 else None, unpacked.get('value')
+        print(f"DEBUG MSGFIX DECODE: Received data (hex): {data.hex() if data else 'None'}", flush=True)
+        if not data:
+            print("DEBUG MSGFIX DECODE: Data is None or empty, returning None, None", flush=True)
+            return None, None
+        try:
+            # Attempt to unpack the entire data
+            unpacked = msgpack.unpackb(data, raw=False)
+            print(f"DEBUG MSGFIX DECODE: Unpacked successfully: {unpacked}", flush=True)
+            expire_at = unpacked.get('expire_at')
+            value = unpacked.get('value')
+            # print(f"DEBUG MSGFIX DECODE: Returning expire_at={expire_at}, value type={type(value)}", flush=True) # Too verbose
+            return expire_at if expire_at != 0 else None, value
+        except msgpack.ExtraData as e_extra:
+            print(f"DEBUG MSGFIX DECODE: msgpack.ExtraData caught: {e_extra}", flush=True)
+            print(f"DEBUG MSGFIX DECODE: Data causing ExtraData (hex): {data.hex()}", flush=True)
+            # Try to unpack just the beginning part if it's ExtraData
+            try:
+                unpacker = msgpack.Unpacker(raw=False)
+                unpacker.feed(data)
+                first_obj = unpacker.unpack()
+                print(f"DEBUG MSGFIX DECODE: First object in ExtraData: {first_obj}", flush=True)
+                offset = unpacker.tell()
+                print(f"DEBUG MSGFIX DECODE: Offset after first object: {offset}", flush=True)
+                if offset < len(data):
+                    remaining_data = data[offset:]
+                    print(f"DEBUG MSGFIX DECODE: Remaining data (hex): {remaining_data.hex()}", flush=True)
+            except Exception as e_unpack_detail:
+                print(f"DEBUG MSGFIX DECODE: Could not get details from ExtraData: {e_unpack_detail}", flush=True)
+            raise # Re-raise the original ExtraData exception
+        except msgpack.UnpackException as e_unpack:
+            print(f"DEBUG MSGFIX DECODE: msgpack.UnpackException (other than ExtraData) caught: {e_unpack}", flush=True)
+            print(f"DEBUG MSGFIX DECODE: Data causing other UnpackException (hex): {data.hex()}", flush=True)
+            raise # Re-raise
+        except Exception as e_gen:
+            print(f"DEBUG MSGFIX DECODE: Generic Exception caught during decode: {e_gen}", flush=True)
+            print(f"DEBUG MSGFIX DECODE: Data causing Generic Exception (hex): {data.hex()}", flush=True)
+            raise
 
     def _execute_init_env(self, path, map_size, max_dbs, lru_db_name_bytes, lmdb_max_keys, lmdb_lru_sample_size, future):
         try:
@@ -209,10 +242,14 @@ class LMDBWorkerThread(threading.Thread):
                         if expire_at is not None and expire_at < now:
                             keys_for_main_db_delete.append(key_b); keys_for_lru_db_delete.append(key_b)
                             if len(keys_for_main_db_delete) >= batch_size: break
-                    except msgpack.UnpackException:
-                        logger.warning(f"LMDBWorker: Corrupted data for key {key_b.decode('utf-8','ignore')} during expired check. Marking for deletion.")
-                        keys_for_main_db_delete.append(key_b); keys_for_lru_db_delete.append(key_b)
-                        if len(keys_for_main_db_delete) >= batch_size: break
+                    except msgpack.UnpackException as e_unpack_outer:
+                        print(f"DEBUG MSGFIX KEYLOG: Caught in _perform_delete_expired_internal: {e_unpack_outer}", flush=True)
+                        print(f"DEBUG MSGFIX KEYLOG: Problematic key: {key_b.decode('utf-8', errors='ignore')}", flush=True)
+                        keys_for_main_db_delete.append(key_b)
+                        keys_for_lru_db_delete.append(key_b)
+                        if len(keys_for_main_db_delete) >= batch_size:
+                            print(f"DEBUG MSGFIX KEYLOG: Batch limit reached in except block of _perform_delete_expired_internal.", flush=True)
+                            break
             if keys_for_main_db_delete:
                 with self.env.begin(db=self.db, write=True) as main_txn_write:
                     for key_b_del in keys_for_main_db_delete:
@@ -240,11 +277,11 @@ class LMDBWorkerThread(threading.Thread):
 
                     if command == CMD_STOP_WORKER:
                         logger.info(f"LMDBWorkerThread {self.name}: STOP_WORKER command received. Terminating.")
-                        if self.env:
-                            internal_close_future = concurrent.futures.Future()
-                            self._execute_close_env(internal_close_future)
-                            try: internal_close_future.result(timeout=5)
-                            except Exception as e_close: logger.error(f"LMDBWorker: Exception closing env during STOP: {e_close}")
+                        # if self.env: # Remove this block
+                        #     internal_close_future = concurrent.futures.Future()
+                        #     self._execute_close_env(internal_close_future)
+                        #     try: internal_close_future.result(timeout=5)
+                        #     except Exception as e_close: logger.error(f"LMDBWorker: Exception closing env during STOP: {e_close}")
                         if future_obj: future_obj.set_result(True); break
                     if not self.env and command != CMD_INIT_ENV:
                         err_msg = f"LMDBWorker: Cmd '{command}' received but env not initialized."
@@ -489,13 +526,12 @@ class AsyncLMDBCacheWrapper(BaseLMDBCacheWrapper):
             self.metrics.lmdb_misses += 1; self.metrics.get_latency.append(time.monotonic() - start_time); return None
         if data_bytes is None:
             self.metrics.lmdb_misses += 1; self.metrics.get_latency.append(time.monotonic() - start_time); return None
-        try: expire_at, value = self._decode_value(data_bytes)
+        try:
+            expire_at, value = self._decode_value(data_bytes)
         except msgpack.UnpackException as e:
-            logger.error(f"Failed to decode value for key '{key}' (async): {e}", exc_info=True)
-            if not self._base_is_closing:
-                asyncio.create_task(self._dispatch_lmdb_op_async((CMD_DELETE_VALUE, 'main', key_b), fire_and_forget=True))
-                asyncio.create_task(self._dispatch_lmdb_op_async((CMD_DELETE_VALUE, 'lru', key_b), fire_and_forget=True))
-            self.metrics.lmdb_deletions += 1; self.metrics.get_latency.append(time.monotonic() - start_time); return None
+            print(f"DEBUG MSGFIX KEYLOG ASYNC GET: Caught in AsyncLMDBCacheWrapper.get: {e}", flush=True)
+            print(f"DEBUG MSGFIX KEYLOG ASYNC GET: Problematic key: {key_b.decode('utf-8', errors='ignore')}", flush=True) # key_b should be in scope
+            return None
         current_time = time.time()
         if expire_at is not None and current_time > expire_at:
             logger.info(f"Key '{key}' found in LMDB but expired (async). Deleting.")
@@ -647,13 +683,12 @@ class SyncLMDBCacheWrapper(BaseLMDBCacheWrapper):
             self.metrics.lmdb_misses += 1; self.metrics.get_latency.append(time.monotonic() - start_time); return None
         if data is None:
             self.metrics.lmdb_misses += 1; self.metrics.get_latency.append(time.monotonic() - start_time); return None
-        try: expire_at, value = self._decode_value(data)
+        try:
+            expire_at, value = self._decode_value(data)
         except msgpack.UnpackException as e:
-            logger.error(f"Failed to decode value for key '{key}' (sync): {e}", exc_info=True)
-            if not self._base_is_closing:
-                self._send_worker_command_sync((CMD_DELETE_VALUE, 'main', key_b))
-                self._send_worker_command_sync((CMD_DELETE_VALUE, 'lru', key_b))
-            self.metrics.lmdb_deletions +=1; self.metrics.get_latency.append(time.monotonic() - start_time); return None
+            print(f"DEBUG MSGFIX KEYLOG SYNC GET: Caught in SyncLMDBCacheWrapper.get: {e}", flush=True)
+            print(f"DEBUG MSGFIX KEYLOG SYNC GET: Problematic key: {key_b.decode('utf-8', errors='ignore')}", flush=True) # key_b should be in scope
+            return None
         current_time = time.time()
         if expire_at is not None and current_time > expire_at:
             logger.info(f"Key '{key}' found in LMDB but expired (sync). Deleting.")
@@ -722,4 +757,3 @@ class SyncLMDBCacheWrapper(BaseLMDBCacheWrapper):
                 logger.info("Sync cleanup loop: Stop event received, exiting."); break
             logger.debug("Sync cleanup loop: Interval ended, proceeding to next cycle.")
         logger.info("Sync cleanup loop finished.")
-```

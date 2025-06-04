@@ -35,6 +35,7 @@ async def cache():
         map_size=BASE_MAP_SIZE,
         cleanup_interval=300 # Longer interval, less likely to interfere
     )
+    cache_instance.lmdb_operation_timeout = 2
     await cache_instance.start_background_cleanup() # Re-enable background cleanup
     yield cache_instance # Test runs here
     await cache_instance.close()
@@ -60,6 +61,7 @@ async def cache_lmdb_evict():
         lmdb_lru_sample_size=LMDB_EVICT_SAMPLE_SIZE,
         cleanup_interval=300 # Not directly tested here
     )
+    cache_instance.lmdb_operation_timeout = 2
     yield cache_instance
     await cache_instance.close()
     if os.path.exists(TEST_CACHE_PATH_LMDB_EVICT):
@@ -82,6 +84,7 @@ async def cache_no_lmdb_limit():
         default_ttl=3600,
         lmdb_lru_sample_size=5
     )
+    cache_instance.lmdb_operation_timeout = 2
     yield cache_instance
     await cache_instance.close()
     if os.path.exists(TEST_CACHE_PATH_NO_LIMIT):
@@ -242,6 +245,29 @@ class TestLMDBLimitsAndEviction:
         db_stats_no_limit = await cache.get_database_stats_async('main')
         main_db_entries_count = db_stats_no_limit['entries']
 
+        # Log all keys in the main database for debugging
+        expected_keys = [f"no_limit_key_{i}" for i in range(NUM_ITEMS_FOR_NO_LIMIT_TEST)]
+        present_keys = []
+        missing_keys = []
+        for k_expected in expected_keys:
+            if await cache.get(k_expected) is not None:
+                present_keys.append(k_expected)
+            else:
+                missing_keys.append(k_expected)
+        logger.info(f"Test test_lmdb_no_key_limit: Present expected keys ({len(present_keys)}): {present_keys}")
+        if missing_keys:
+            logger.warning(f"Test test_lmdb_no_key_limit: Missing expected keys ({len(missing_keys)}): {missing_keys}")
+
+        # Attempt to get a few potential "extra" keys to see if they exist
+        extra_keys_to_check = [f"no_limit_key_{NUM_ITEMS_FOR_NO_LIMIT_TEST}", f"no_limit_key_{NUM_ITEMS_FOR_NO_LIMIT_TEST+1}"]
+        found_extra_keys = []
+        for ek in extra_keys_to_check:
+            if await cache.get(ek) is not None:
+                found_extra_keys.append(ek)
+        if found_extra_keys:
+            logger.warning(f"Test test_lmdb_no_key_limit: Found unexpected extra keys: {found_extra_keys}")
+
+        logger.info(f"Test test_lmdb_no_key_limit: Main DB actual entry count before assert: {main_db_entries_count}")
         assert main_db_entries_count == NUM_ITEMS_FOR_NO_LIMIT_TEST, \
                f"All {NUM_ITEMS_FOR_NO_LIMIT_TEST} items should be present in LMDB when lmdb_max_keys is None"
 
