@@ -32,9 +32,9 @@ async def cache():
         default_ttl=BASE_DEFAULT_TTL,
         lmdb_max_keys=BASE_LMDB_MAX_KEYS,
         map_size=BASE_MAP_SIZE,
-        cleanup_interval=1 # Short interval for testing, though not directly tested here
+        cleanup_interval=300 # Longer interval, less likely to interfere
     )
-    await cache_instance.start_background_cleanup()
+    await cache_instance.start_background_cleanup() # Re-enable background cleanup
     yield cache_instance # Test runs here
     await cache_instance.close()
     if os.path.exists(TEST_CACHE_PATH):
@@ -189,10 +189,12 @@ class TestLMDBLimitsAndEviction:
                 cache.lru_cache.pop(key)
             await asyncio.sleep(0.001)
 
-        current_lmdb_entries = 0
-        with cache.env.begin(db=cache.db) as txn:
-            current_lmdb_entries = txn.stat()['entries']
+        # current_lmdb_entries = 0
+        # with cache.env.begin(db=cache.db) as txn: # OLD WAY
+        #     current_lmdb_entries = txn.stat()['entries']
 
+        db_stats = await cache.get_database_stats_async('main') # NEW WAY
+        current_lmdb_entries = db_stats['entries']
         logger.info(f"LMDB entries after puts: {current_lmdb_entries}, lmdb_max_keys: {LMDB_EVICT_MAX_KEYS}")
 
         assert current_lmdb_entries <= LMDB_EVICT_MAX_KEYS, "LMDB entries should be at or below max_keys after eviction"
@@ -216,22 +218,13 @@ class TestLMDBLimitsAndEviction:
         logger.info(f"Early keys present (from first {LMDB_EVICT_SAMPLE_SIZE}): {checked_early_keys_present}")
         logger.info(f"Later keys present (from last {LMDB_EVICT_SAMPLE_SIZE}): {checked_later_keys_present}")
 
-        lru_db_keys_with_time = []
-        with cache.env.begin(db=cache.lru_db) as txn:
-            for key_b, time_b in txn.cursor():
-                try:
-                    lru_db_keys_with_time.append({'key': key_b.decode('utf-8'), 'time': float(time_b.decode('utf-8'))})
-                except ValueError:
-                    continue
-        lru_db_keys_with_time.sort(key=lambda x: x['time'])
+        # Direct lru_db iteration is removed as it's harder with worker model from tests.
+        # Rely on main DB stats and eviction metrics.
+        lru_stats = await cache.get_database_stats_async('lru')
+        logger.info(f"Total keys in LRU DB (stats): {lru_stats['entries']}")
 
-        main_db_keys = set()
-        with cache.env.begin(db=cache.db) as txn:
-            for key_b, _ in txn.cursor():
-                main_db_keys.add(key_b.decode('utf-8'))
-
-        logger.info(f"Total keys in LRU DB: {len(lru_db_keys_with_time)}")
-        logger.info(f"Total keys in Main DB: {len(main_db_keys)}")
+        main_db_stats_updated = await cache.get_database_stats_async('main')
+        logger.info(f"Total keys in Main DB (stats after gets): {main_db_stats_updated['entries']}")
 
     @pytest.mark.asyncio
     async def test_lmdb_no_key_limit(self, cache_no_lmdb_limit: AsyncLMDBCacheWrapper):
@@ -245,9 +238,8 @@ class TestLMDBLimitsAndEviction:
             if key in cache.lru_cache:
                 cache.lru_cache.pop(key)
 
-        main_db_entries_count = 0
-        with cache.env.begin(db=cache.db) as txn:
-            main_db_entries_count = txn.stat()['entries']
+        db_stats_no_limit = await cache.get_database_stats_async('main')
+        main_db_entries_count = db_stats_no_limit['entries']
 
         assert main_db_entries_count == NUM_ITEMS_FOR_NO_LIMIT_TEST, \
                f"All {NUM_ITEMS_FOR_NO_LIMIT_TEST} items should be present in LMDB when lmdb_max_keys is None"
