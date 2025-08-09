@@ -40,7 +40,7 @@ export async function on_request (
 
     const { auth, timeout = 5_000 } = opts;
 
-    const auth_header = auth ?  : undefined;
+    const auth_header = auth ? `Basic ${ btoa(auth) }` : undefined;
 
     return async function (req: ServerRequest) {
 
@@ -107,7 +107,7 @@ export const pre_serves = ({
             return reject(new Error('no http port'));
         }
 
-        info();
+        info(`http [${ port }]`);
 
         resolve(http({ port }));
 
@@ -130,7 +130,7 @@ export const pre_serves = ({
         const key = await read_file(opts_key);
         const cert = await read_file(opts_cert);
 
-        info();
+        info(`https [${ port }]`);
 
         return https({ port, key, cert });
 
@@ -138,7 +138,7 @@ export const pre_serves = ({
 
 });
 
-const { serve_http, serve_https } = pre_serves({});
+export const { serve_http, serve_https } = pre_serves({});
 
 
 
