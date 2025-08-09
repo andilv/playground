@@ -17,5 +17,10 @@
   "bugs": {
     "url": "https://github.com/andilv/playground/issues"
   },
-  "homepage": "https://github.com/andilv/playground#readme"
+  "homepage": "https://github.com/andilv/playground#readme",
+  "dependencies": {
+    "@tanstack/react-virtual": "^3.13.12",
+    "nostr-tools": "^2.16.2",
+    "react-nostr": "^0.0.15"
+  }
 }
