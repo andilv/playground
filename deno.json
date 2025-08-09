@@ -1,0 +1,9 @@
+{
+    "tasks": {
+        "start": "deno run --allow-net --allow-read main.ts"
+    },
+    "permissions": {
+        "net": true,
+        "read": true
+    }
+}
