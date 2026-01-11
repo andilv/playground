@@ -1,0 +1,26 @@
+{
+  "name": "playground",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andilv/playground.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/andilv/playground/issues"
+  },
+  "homepage": "https://github.com/andilv/playground#readme",
+  "dependencies": {
+    "@tanstack/react-virtual": "^3.13.12",
+    "nostr-tools": "^2.16.2",
+    "react-nostr": "^0.0.15"
+  }
+}
